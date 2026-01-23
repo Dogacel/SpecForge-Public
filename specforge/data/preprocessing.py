@@ -40,6 +40,7 @@ except ImportError:
     HAS_QWEN_VL_UTILS = False
     process_vision_info = None
 
+from specforge.utils import padding
 
 from .parse import GeneralParser, HarmonyParser, ThinkingParser
 from .template import TEMPLATE_REGISTRY, ChatTemplate
@@ -154,6 +155,8 @@ def preprocess_conversations(
     for key, value_list in kwargs.items():
         for i, value in enumerate(value_list):
             kwargs_list[i][key] = value
+
+    skip_count = 0
     for source, kwargs_item in zip(conversations, kwargs_list):
         if not source:
             # if the source is None, skip it
@@ -165,9 +168,15 @@ def preprocess_conversations(
             train_only_last_turn=train_only_last_turn,
             **kwargs_item,
         )
-        results["input_ids"].append(input_ids[None, :])
-        results["loss_mask"].append(loss_mask[None, :])
-        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        if loss_mask.sum() > 0:
+            results["input_ids"].append(input_ids[None, :])
+            results["loss_mask"].append(loss_mask[None, :])
+            results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        else:
+            skip_count += 1
+
+    if skip_count > 0:
+        print(f"Total conversations skipped due to zero loss mask: {skip_count}")
     return results
 
 
@@ -463,9 +472,9 @@ class OfflineEagle3Dataset(torch.utils.data.Dataset):
 
         new_data["attention_mask"] = torch.ones_like(loss_mask, dtype=torch.long)
         new_data["loss_mask"] = loss_mask
-        new_data["target"] = target
+        new_data["target"] = padding(target, left=False)
         new_data["hidden_state"] = hidden_state
-        new_data["input_ids"] = input_ids
+        new_data["input_ids"] = padding(input_ids, left=False)
         if transform:
             new_data = transform(new_data)
         return new_data
@@ -531,11 +540,9 @@ def generate_vocab_mapping_file(
 
     # we first count the frequency of effectiev tokens in the dataset
     token_dict = Counter()
-    for input_ids, loss_mask in tqdm(
-        zip(dataset["input_ids"], dataset["loss_mask"]),
-        total=len(dataset),
-        desc="Counting tokens for vocab mapping",
-    ):
+    for item in tqdm(dataset, desc="Counting tokens for vocab mapping"):
+        input_ids = item["input_ids"]
+        loss_mask = item["loss_mask"]
         masked_ids = input_ids[loss_mask == 1]
         unique_ids, counts = masked_ids.unique(return_counts=True)
         batch_token_dict = dict(zip(unique_ids.tolist(), counts.tolist()))

@@ -18,24 +18,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import random
 import re
 from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
-
 from datasets import Dataset
-from specforge.distributed import get_draft_sp_group
+from torch.utils.data import DataLoader, Subset
 
+from specforge.distributed import get_draft_sp_group
+from specforge.data.distributed_length_grouped_sampler import DistributedLengthGroupedSampler
 
 class DataCollatorWithPadding:
     """
     Datacollator that will dynamically pad the inputs for batching.
     """
 
-    def __init__(self):
+    def __init__(self, max_seq_len: int, **kwargs):
+        self.max_seq_len = max_seq_len
         self.sp_degree = torch.distributed.get_world_size(get_draft_sp_group())
+        self.pow_2_lookup = [int(2**i) for i in range(20)]
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -90,6 +94,11 @@ class DataCollatorWithPadding:
                 - loss_mask: torch.Tensor of shape (B, N)
         """
         max_length = max(item["input_ids"].shape[1] for item in features)
+        max_length = min(max_length, self.max_seq_len)
+
+        # Find nearest power of 2
+        # max_length = [x for x in self.pow_2_lookup if x >= max_length][0]
+
         # pad for sequence parrel
         max_length = (
             (max_length + self.sp_degree - 1) // self.sp_degree
@@ -133,6 +142,9 @@ class VlmDataCollatorWithPadding:
     """
     Datacollator that will dynamically pad the inputs for batching.
     """
+
+    def __init__(self, **kwargs):
+        pass
 
     def paddingtensor(self, intensors: torch.Tensor, N: int) -> torch.Tensor:
         """
@@ -231,12 +243,16 @@ class VlmDataCollatorWithPadding:
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
+    max_length: int,
     num_workers: int = 4,
     process_group: Optional[dist.ProcessGroup] = None,
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
+    sampling_ratio: float = 1.0,
+    cache_dir: Optional[str] = None,
+    cache_key: Optional[str] = None,
     **dataloader_kwargs,
 ) -> DataLoader:
     """
@@ -257,9 +273,33 @@ def prepare_dp_dataloaders(
     """
     world_size = dist.get_world_size(process_group)
     rank = dist.get_rank(process_group)
-    sampler = DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
+
+    length_file = os.path.join(cache_dir, f"{cache_key}_lengths.pt") if cache_dir and cache_key else None
+
+    # Load as list[int]
+    lengths = None
+    if length_file and os.path.exists(length_file):
+        lengths = torch.load(length_file)
+
+    if sampling_ratio < 1.0:
+        assert lengths is not None, "lengths must be provided when using sampling_ratio < 1.0." + \
+         "You can generate lengths by running this script once with sampling_ratio=1.0 to create the lengths file."
+        rng = random.Random(42)
+        indices = rng.sample(range(len(dataset)), int(len(dataset) * sampling_ratio))
+        lengths = rng.sample(lengths, int(len(lengths) * sampling_ratio))
+        dataset = Subset(dataset, indices)
+
+    sampler = DistributedLengthGroupedSampler(
+        batch_size=batch_size,
+        dataset=dataset, 
+        num_replicas=world_size, 
+        rank=rank,
+        lengths=lengths,
     )
+
+    if lengths is None and length_file and not os.path.exists(length_file):
+        torch.save(sampler.lengths, length_file)
+
     if is_vlm:
         datacollator_cls = VlmDataCollatorWithPadding
     else:
@@ -275,7 +315,7 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=datacollator_cls(max_seq_len=max_length),
         drop_last=True,
         **dataloader_kwargs,
     )

@@ -101,7 +101,6 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
         """
@@ -186,4 +185,5 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
         vocab_mapping = torch.load(file_path)
         self.t2d.copy_(vocab_mapping["t2d"])
         self.d2t.copy_(vocab_mapping["d2t"])
+        self.t2d_indices = torch.nonzero(self.t2d).squeeze() 
         self.vocab_mapping_loaded = True

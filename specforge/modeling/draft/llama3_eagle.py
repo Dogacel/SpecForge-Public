@@ -25,10 +25,9 @@ from .base import Eagle3DraftModel
 
 try:
     from flash_attn import flash_attn_func
-except ImportError:
+except:
     warnings.warn(
-        "flash_attn is not found, falling back to flex_attention. "
-        "Please install flash_attn if you want to use the flash attention backend."
+        "flash_attn is not found, please install flash_attn if you want to use the flash attention backend"
     )
     flash_attn_func = None
 
@@ -160,24 +159,27 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim
 
 
 def prepare_decoder_attention_mask(
-    attention_mask, input_shape, inputs_embeds, past_key_values_length
+    attention_mask, input_shape, hidden_states, past_key_values_length
 ):
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
     # create causal mask
     # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
     combined_attention_mask = None
     if input_shape[-1] > 1:
         combined_attention_mask = _make_causal_mask(
             input_shape,
-            inputs_embeds.dtype,
-            device=inputs_embeds.device,
+            dtype,
+            device=device,
             past_key_values_length=past_key_values_length,
         )
 
     if attention_mask is not None:
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         expanded_attn_mask = _expand_mask(
-            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
-        ).to(inputs_embeds.device)
+            attention_mask, dtype, tgt_len=input_shape[-1]
+        ).to(device)
         combined_attention_mask = (
             expanded_attn_mask
             if combined_attention_mask is None
@@ -511,7 +513,7 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, include_embed, layer_idx=0):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -523,15 +525,18 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.layer_idx = layer_idx
+
+        input_size = self.hidden_size * 2 if include_embed else self.hidden_size
 
         self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+            input_size, self.num_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            input_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            input_size, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -619,10 +624,9 @@ class LlamaAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[List[torch.Tensor]] = None,
+        cache_hidden: Optional[List[torch.Tensor]] | Cache = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -750,21 +754,21 @@ class LlamaFlexAttention(LlamaAttention):
         - hidden_states: input hidden states
         - attention_mask: attention mask not expanded, straight from data loader.
         - position_ids: position ids
-        - past_key_values: dynamic cache used for storing past key and value states.
+        - cache_hidden: dynamic cache used for storing past key and value states.
     """
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[List[torch.Tensor]] = None,
+        cache_hidden: Cache,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        past_key_values = cache_hidden
         past_seen_tokens = (
             past_key_values.get_seq_length() if past_key_values is not None else 0
         )
@@ -810,7 +814,7 @@ class LlamaFlexAttention(LlamaAttention):
         key_cache, value_cache = past_key_values.update(
             key_states,
             value_states,
-            layer_idx=0,  # TODO: support multiple layers
+            layer_idx=self.layer_idx,
             cache_kwargs=cache_kwargs,
         )
 
@@ -868,7 +872,6 @@ class LlamaFlashAttention(LlamaAttention):
         cache_hidden: Optional[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -972,8 +975,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, layer_idx=0):
+        super().__init__(config, layer_idx)
         assert (
             dist.is_initialized()
         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
@@ -990,10 +993,9 @@ class LlamaUSPFlashAttention(LlamaAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[List[torch.Tensor]] = None,
+        cache_hidden: Optional[List[torch.Tensor]] | Cache = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -1240,19 +1242,20 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "sdpa", include_embed: bool = True, layer_idx: int = 0):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.include_embed = include_embed
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(config=config, include_embed=include_embed, layer_idx=layer_idx)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(config=config, include_embed=include_embed, layer_idx=layer_idx)
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(config=config, include_embed=include_embed, layer_idx=layer_idx)
         elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
+            self.self_attn = LlamaUSPFlashAttention(config=config, include_embed=include_embed, layer_idx=layer_idx)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1274,7 +1277,6 @@ class LlamaDecoderLayer(nn.Module):
         cache_hidden: List[List[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
     ) -> Tuple[
@@ -1289,24 +1291,24 @@ class LlamaDecoderLayer(nn.Module):
                 Whether or not to return the attentions tensors of all attention layers. See `attentions` under
                 returned tensors for more detail.
             use_cache (`bool`, *optional*):
-                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
-                (see `past_key_values`).
-            past_key_values (`Cache`, *optional*): cached past key and value projection states
+                If set to `True`, `cache_hidden` key value states are returned and can be used to speed up decoding
+                (see `cache_hidden`).
         """
 
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
 
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        if self.include_embed:
+            input_emb = self.input_layernorm(input_emb)
+            hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
@@ -1336,7 +1338,12 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(config, attention_backend=attention_backend, include_embed=(i==0), layer_idx=i)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1361,9 +1368,13 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        inputs_embeds: torch.Tensor,
+        input_emb: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        ttt_length: int = 1,
+        cache_hidden: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        fuse_hidden: bool = True,
+        return_logits: bool = False,
     ):
         """
         Arguments:
@@ -1373,44 +1384,45 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
-        if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
-            cache_hidden = None
-        else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
-            cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()
 
         # make position ids
         device = hidden_states.device
-        position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+        if position_ids is None:
+            position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
+            position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
 
         # make attention mask
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = prepare_decoder_attention_mask(
-            attention_mask, (batch_size, seq_length), hidden_states, 0
-        )
+            attention_mask = prepare_decoder_attention_mask(
+                attention_mask, (batch_size, seq_length), hidden_states, 0
+            )
 
         # fc
-        hidden_states = self.fc(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
-        )
+        if fuse_hidden:
+            hidden_states = self.fc(hidden_states)
+    
+        for layer in self.layers:
+            hidden_states = layer(
+                input_emb=input_emb,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=False,
+                use_cache=use_cache,
+            )
 
         # norm
         hidden_states = self.norm(hidden_states)
+
+        if return_logits:
+            logits = self.lm_head(hidden_states)
+            return hidden_states, logits
 
         return hidden_states
 
@@ -1423,8 +1435,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        norm_hidden_states = self.norm(hidden_states)
-        return self.lm_head(norm_hidden_states)
+        return self.lm_head(hidden_states)
 
     def backbone(
         self,
@@ -1433,16 +1444,17 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         cache_hidden: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-        past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=False,
-            use_cache=False,
-        )
+        for layer in self.layers:
+            hidden_states = layer(
+                input_emb=input_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                output_attentions=False,
+                use_cache=use_cache,
+            )
+        norm_hidden_states = self.norm(hidden_states)
+        return norm_hidden_states

@@ -11,6 +11,8 @@ class TrackerArgs:
     wandb_project: str = None
     wandb_name: str = None
     wandb_key: str = None
+    wandb_id: str = None
+    wandb_resume_from: str = None
     swanlab_project: str = None
     swanlab_name: str = None
     swanlab_key: str = None
@@ -33,6 +35,13 @@ class TrackerArgs:
         parser.add_argument("--wandb-project", type=str, default=None)
         parser.add_argument("--wandb-name", type=str, default=None)
         parser.add_argument("--wandb-key", type=str, default=None, help="W&B API key.")
+        parser.add_argument("--wandb-id", type=str, default=None, help="WandB run ID to resume from")
+        parser.add_argument(
+            "--wandb-resume-from",
+            type=str,
+            default=None,
+        )
+
         # swanlab-specific args
         parser.add_argument(
             "--swanlab-project",

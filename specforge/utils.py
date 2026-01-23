@@ -10,7 +10,7 @@ from torch.distributed._tensor import DTensor, Shard, distribute_tensor
 from transformers import AutoConfig, PretrainedConfig
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 @contextmanager
 def rank_0_priority():
@@ -33,13 +33,17 @@ def default_torch_dtype(dtype: torch.dtype):
 
 
 @torch.no_grad()
-def padding(tensor, left=True):
-    zeropadding = torch.zeros_like(tensor[:, -1:])
+def padding(tensor, left=True, amount=1):
+    # Important as amount=0 is ignrored by torch.roll
+    if amount == 0:
+        return tensor
+
+    out = torch.roll(tensor, shifts=amount if left else -amount, dims=1)
     if left:
-        tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+        out[:, :amount] = 0
     else:
-        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
-    return tensor
+        out[:, -amount:] = 0
+    return out
 
 
 def load_config_from_file(config_path: str):
@@ -75,22 +79,22 @@ def print_on_rank0(message):
     if dist.get_rank() == 0:
         logger.info(message)
 
-
-def get_last_checkpoint(folder, prefix="epoch"):
+def get_checkpoints_sorted(folder):
     content = os.listdir(folder)
-    _re_checkpoint = re.compile(r"^" + prefix + r"_(\d+)$")
+    _re_checkpoint = re.compile(r"^epoch_(\d+)_step_(\d+)$")
     checkpoints = [
         path
         for path in content
         if _re_checkpoint.search(path) is not None
         and os.path.isdir(os.path.join(folder, path))
     ]
-    if len(checkpoints) == 0:
-        return
-    return os.path.join(
-        folder,
-        max(checkpoints, key=lambda x: int(_re_checkpoint.search(x).groups()[0])),
-    )
+
+    def _key_fn(x):
+        groups = _re_checkpoint.search(x).groups()
+        return int(groups[0]), int(groups[1]) # epoch, step
+
+    checkpoints.sort(key=_key_fn)
+    return [os.path.join(folder, cp) for cp in checkpoints]
 
 
 def generate_draft_model_config(

@@ -1,10 +1,13 @@
 import argparse
 import hashlib
+import inspect
+from itertools import islice
 import math
 import os
+import shutil
 import time
 from argparse import ArgumentParser, Namespace
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -45,21 +48,27 @@ from specforge.modeling.target import (
     get_eagle3_target_model,
 )
 from specforge.optimizer import BF16Optimizer
-from specforge.tracker import Tracker, create_tracker, get_tracker_class
+from specforge.tracker import Tracker, WandbTracker, create_tracker, get_tracker_class
 from specforge.utils import (
     create_draft_config_from_target,
-    get_last_checkpoint,
+    get_checkpoints_sorted,
     print_args_with_dots,
     print_on_rank0,
     print_with_rank,
     rank_0_priority,
 )
 
+from contextlib import nullcontext
+from torch.profiler import profile, record_function, ProfilerActivity, schedule
+
+__ARGS: Any = {}
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
     This function is used to parse the arguments for the training script.
     """
+    global __ARGS
+
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
     # add model-related arguments
@@ -132,6 +141,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
     )
     training_group.add_argument("--batch-size", type=int, default=1)
+    training_group.add_argument("--eval-batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=1e-4)
     training_group.add_argument("--max-length", type=int, default=2048)
     training_group.add_argument("--warmup-ratio", type=float, default=0.015)
@@ -155,8 +165,10 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
         default=None,
         help="directory includes the checkpoint to start training with",
     )
+    training_group.add_argument("--eval-ratio", type=float, default=1.0)
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
+    training_group.add_argument("--max-save-checkpoints", type=int, default=3)
     training_group.add_argument(
         "--log-interval",
         type=int,
@@ -215,9 +227,7 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     # profiling related args
     profiling_group = parser.add_argument_group("profiling")
     profiling_group.add_argument("--profile", action="store_true")
-    profiling_group.add_argument("--profile-start-step", type=int, default=30)
-    profiling_group.add_argument("--profile-num-steps", type=int, default=4)
-    profiling_group.add_argument("--profile-record-shapes", action="store_true")
+    profiling_group.add_argument("--profile-memory", action="store_true")
 
     # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
@@ -227,9 +237,18 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
-    args = parser.parse_args()
-    return parser, args
+    __ARGS = parser.parse_args()
+    return parser, __ARGS
 
+class DummyProfiler:
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: self
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        pass
 
 def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
     """
@@ -326,6 +345,36 @@ def build_target_model(
         )
         return target_head, None
 
+def load_checkpoint(args: Namespace) -> Tuple[int, int, Optional[str], Any]:
+    """Load checkpoint and return starting epoch and global_step"""
+    if not args.resume or not os.path.isdir(args.output_dir):
+        print_on_rank0("Starting training from scratch")
+        return 0, 0, None, None
+
+    checkpoint_paths = get_checkpoints_sorted(args.output_dir)
+    if not checkpoint_paths:
+        print_on_rank0("No checkpoint found, starting from scratch")
+        return 0, 0, None, None
+
+    for checkpoint_path in reversed(checkpoint_paths):
+        try:
+            training_state_path = os.path.join(checkpoint_path, "training_state.pt")
+            if not os.path.exists(training_state_path):
+                print_on_rank0(f"Training state not found at {training_state_path}")
+                continue
+
+            # Load training state
+            state = torch.load(training_state_path, weights_only=False, map_location="cpu")
+            start_epoch = state["epoch"]
+            global_step = state["global_step"]
+
+            print_on_rank0(f"Resumed from checkpoint {checkpoint_path}: epoch {start_epoch}, step {global_step}")
+            return start_epoch, global_step, checkpoint_path, state
+        except Exception as e:
+            print_on_rank0(f"Failed to load checkpoint from {checkpoint_path}: {e}")
+    print_on_rank0("No valid checkpoint found, starting from scratch")
+
+    return 0, 0, None, None
 
 def sanity_check(args: Namespace) -> None:
     """
@@ -339,12 +388,13 @@ def sanity_check(args: Namespace) -> None:
     """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
+    args.target_eval_batch_size = args.tp_size * args.eval_batch_size
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
 
 
-def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
+def build_draft_model(args: Namespace, draft_model_last_checkpoint) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
     if args.draft_model_config is None:
         # Auto-generate and save config file
@@ -356,27 +406,10 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # Handle base ckpt, config file
-    draft_model_last_checkpoint = None
-    if args.ckpt_dir is not None:
-        if os.path.isdir(args.ckpt_dir):
-            draft_model_config = AutoDraftModelConfig.from_file(
-                os.path.join(args.ckpt_dir, "config.json")
-            )
-            draft_model_last_checkpoint = args.ckpt_dir
-            print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
-        else:
-            raise ValueError(
-                f"Provided base model dir {args.ckpt_dir} is not a valid directory."
-            )
-
-    # detecting last ckpt for draft model
-    if args.resume and os.path.isdir(args.output_dir):
-        print_on_rank0(args.output_dir)
-        draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
     if draft_model_last_checkpoint:
+        draft_model_config = AutoDraftModelConfig.from_file(
+            os.path.join(draft_model_last_checkpoint, "config.json")
+        )
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
@@ -393,6 +426,18 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     draft_model.freeze_embedding()
     return draft_model_config, draft_model
 
+def save_sources(draft_model, tracker, save_dir):
+    unwrapped = draft_model._fsdp_wrapped_module if isinstance(draft_model, FSDP) else draft_model
+    draft_model_source = inspect.getfile(unwrapped.__class__)
+
+    os.makedirs(save_dir, exist_ok=True)
+    modeling_dst = os.path.join(save_dir, os.path.basename(draft_model_source))
+    shutil.copy(draft_model_source, modeling_dst)
+
+    if isinstance(tracker, WandbTracker) and tracker.rank == 0:
+        import wandb
+        wandb.save(modeling_dst, base_path=save_dir)
+        wandb.save(__file__, base_path=os.path.dirname(__file__))
 
 def build_dataloaders(
     args: Namespace,
@@ -412,6 +457,7 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+    cache_dir = os.path.join(args.cache_dir, "processed_dataset")
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
@@ -422,7 +468,7 @@ def build_dataloaders(
             tokenizer=tokenizer,
             chat_template=args.chat_template,
             max_length=args.max_length,
-            cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
+            cache_dir=cache_dir,
             cache_key=cache_key,
             is_vlm=args.is_vlm,
             is_preformatted=args.is_preformatted,
@@ -454,16 +500,30 @@ def build_dataloaders(
             if args.attention_backend == "usp" and not is_online
             else get_dp_group()
         ),
+        pin_memory=True,
         is_vlm=args.is_vlm,
+        max_length=args.max_length,
+        cache_dir=cache_dir,
+        cache_key=cache_key,
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
+            cache_params_string = (
+                f"{args.eval_data_path}-"
+                f"{args.max_length}-"
+                f"{args.chat_template}-"
+                f"{args.target_model_path}"  # Tokenizer may also different
+            )
+            cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
+            cache_dir = os.path.join(args.cache_dir, "processed_dataset")
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
                 args.chat_template,
                 args.max_length,
+                cache_dir=cache_dir,
+                cache_key=cache_key,
                 is_vlm=args.is_vlm,
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
@@ -477,7 +537,7 @@ def build_dataloaders(
             )
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
-            args.target_batch_size,
+            args.target_eval_batch_size,
             num_workers=args.dataloader_num_workers,
             shuffle=False,
             process_group=(
@@ -485,7 +545,12 @@ def build_dataloaders(
                 if args.attention_backend == "usp" and not is_online
                 else get_dp_group()
             ),
+            pin_memory=True,
             is_vlm=args.is_vlm,
+            max_length=args.max_length,
+            sampling_ratio=args.eval_ratio,
+            cache_dir=cache_dir,
+            cache_key=cache_key,
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -503,6 +568,7 @@ def save_checkpoints(
     step: int,
     eagle3_model: nn.Module,
     optimizer: Optimizer,
+    eval_score: float,
 ):
     epoch_output_dir = os.path.join(args.output_dir, f"epoch_{epoch}_step_{step}")
     if dist.get_rank() == 0:
@@ -536,8 +602,48 @@ def save_checkpoints(
                 state_dict=draft_model_state_dict,
             )
             print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
+            if eval_score is not None:
+                with open(os.path.join(epoch_output_dir, "eval_score.txt"), "w") as f:
+                    f.write(str(eval_score))
+                print_on_rank0(f"Saved eval score: {eval_score}")
         dist.barrier()
 
+        if dist.get_rank() == 0:
+            # Delete older checkpoints, keeping best by eval score
+            checkpoints = get_checkpoints_sorted(args.output_dir)  # oldest to newest
+
+            # Find the best checkpoint
+            best_cp = None
+            best_score = float("-inf")
+            for cp in checkpoints:
+                score_file = os.path.join(cp, "eval_score.txt")
+                if os.path.exists(score_file):
+                    with open(score_file, "r") as f:
+                        score = float(f.read().strip())
+                    if score > best_score:
+                        best_score = score
+                        best_cp = cp
+            
+            # Update "best" symlink
+            if best_cp is not None:
+                best_link = os.path.join(args.output_dir, "best")
+                if os.path.islink(best_link):
+                    os.unlink(best_link)
+                os.symlink(os.path.basename(best_cp), best_link)
+                print_on_rank0(f"Updated 'best' symlink -> {os.path.basename(best_cp)} (score: {best_score})")
+
+            # Delete all except: best checkpoint + most recent (last in list)
+            most_recent = checkpoints[-1]
+            i = 0
+            while len(checkpoints) > args.max_save_checkpoints:
+                cp = checkpoints[i]
+                if cp != best_cp and cp != most_recent:
+                    print_on_rank0(f"Deleting older checkpoint {cp}")
+                    assert cp.startswith(args.output_dir) and len(args.output_dir) > 10
+                    shutil.rmtree(cp)
+                    checkpoints.pop(i)
+                i += 1
+        dist.barrier()
 
 def run_forward(
     args: Namespace,
@@ -577,9 +683,9 @@ def run_forward(
                 )
             else:
                 eagle3_data = target_model.generate_eagle3_data(
-                    input_ids=data["input_ids"].cuda(),
-                    attention_mask=data["attention_mask"].cuda(),
-                    loss_mask=data["loss_mask"].cuda(),
+                    input_ids=data["input_ids"].cuda(non_blocking=True),
+                    attention_mask=data["attention_mask"].cuda(non_blocking=True),
+                    loss_mask=data["loss_mask"].cuda(non_blocking=True),
                 )
 
             input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
@@ -608,19 +714,20 @@ def run_forward(
         )
     return plosses, acces
 
+def log_memory(tag: str):
+    if __ARGS.profile_memory and dist.get_rank() == 0:
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        print(f"[MEMORY] {tag}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
-def run_backward_and_update(
-    args: Namespace, plosses: List[torch.Tensor], optimizer: Optimizer, global_step: int
-) -> None:
+def run_backward(args: Namespace, plosses: List[torch.Tensor]) -> None:
     ploss_weight = [0.8**i for i in range(len(plosses))]
     ploss = (
         sum([ploss_weight[i] * plosses[i] for i in range(len(plosses))])
         / args.draft_accumulation_steps
     )
     ploss.backward()
-
-    if global_step % args.draft_accumulation_steps == 0:
-        optimizer.step()
 
 
 def record_metrcs(
@@ -645,17 +752,19 @@ def record_metrcs(
     accuracies = accuracies.cpu().tolist()
     for i in range(len(accuracies)):
         logdict[f"{mode}/acc_{i}"] = accuracies[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
-        )
+        # print_on_rank0(
+        #     f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+        # )
 
     dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
     plosses = plosses.cpu().tolist()
     for i in range(len(plosses)):
         logdict[f"{mode}/ploss_{i}"] = plosses[i]
-        print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
-        )
+        # print_on_rank0(
+        #     f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
+        # )
+        if (plosses[i] <= 0) or (math.isnan(plosses[i])):
+            pass
     tracker.log(logdict, step=global_step)
 
 
@@ -727,15 +836,27 @@ def main():
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
 
+    log_memory("Start")
+    if args.profile_memory:
+        torch.cuda.memory._record_memory_history(max_entries=100000)
+
     sanity_check(args)
     print_args_with_dots(args)
-    print_with_rank("Initialized distributed environment")
+    print_with_rank(f"Initialized distributed environment, world_size: {dist.get_world_size()}, rank: {dist.get_rank()}")
+
+    start_epoch, global_step, draft_model_last_checkpoint, optimizer_state = load_checkpoint(args)
 
     # ================================================
     # 2. Build models
     # ================================================
-    draft_model_config, draft_model = build_draft_model(args)
+    draft_model_config, draft_model = build_draft_model(args, draft_model_last_checkpoint)
+    log_memory("After draft model init")
+
     target_model, processor = build_target_model(args, draft_model_config, is_online)
+    log_memory("After target model init")
+
+    # Set this attribute to show in wandb
+    args.draft_model_config_dict = draft_model_config.__dict__
 
     # ================================================
     # 3. Build dataloader
@@ -749,6 +870,7 @@ def main():
     print_with_rank("Loaded vocab mapping")
 
     # Calculate total steps if not provided
+    steps_per_epoch = 0
     if args.total_steps is None:
         steps_per_epoch = math.ceil(
             len(train_dataloader) / args.draft_accumulation_steps
@@ -798,9 +920,10 @@ def main():
             param_dtype=torch.bfloat16,
             buffer_dtype=torch.bfloat16,
         ),
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+        sharding_strategy=ShardingStrategy.NO_SHARD, # DDP
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
     )
+    log_memory("After FSDP wrap")
     print_with_rank("Initialized Eagle3 FSDP model")
 
     # ================================================
@@ -813,22 +936,35 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
     )
+    log_memory("After optimizer init")
+
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+        print_with_rank("Loaded optimizer state from checkpoint")
     print_with_rank("Initialized optimizer and scheduler")
 
     # ================================================
     # 6. Build tracker
     # ================================================
     tracker = build_tracker(args, parser)
-    global_step = 0
-    start_epoch = 0
+
+    # Save source files
+    if dist.get_rank() == 0:
+        save_sources(draft_model, tracker, args.output_dir)
+
     dist.barrier()
 
     last_time = time.time()
+    last_eval_acc = 0.0
 
     # ================================================
     # 7. Start training
     # ================================================
-    print_on_rank0(f"Starting training from epoch {start_epoch}")
+
+    # Calculate which batch index we should be at
+    steps_to_skip = steps_per_epoch * start_epoch + global_step
+
+    print_on_rank0(f"Starting training from epoch {start_epoch}, step: {global_step}")
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
@@ -837,85 +973,101 @@ def main():
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
-                train_dataloader, desc=f"Training Epoch {epoch}", leave=True
+                train_dataloader, desc=f"Training Epoch {epoch}", leave=True, initial=0, smoothing=0.01
             )
         else:
             progress_bar = train_dataloader
 
-        for data in progress_bar:
-            global_step += 1
+        if args.profile:
+            profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=schedule(
+                    wait=4 * args.draft_accumulation_steps,
+                    warmup=2 * args.draft_accumulation_steps,
+                    active=3 * args.draft_accumulation_steps,
+                    repeat=1,
+                ),
+                record_shapes=True,
+                with_stack=True,
+                with_modules=True,
+                profile_memory=True,
+            )
+        else:
+            profiler = DummyProfiler()
 
-            # ================================================
-            # 7.0 Profiling
-            # ================================================
-            if args.profile:
-                # we add the step by 1 to align with global step
-                if global_step == args.profile_start_step + 1:
-                    print("Start profile")
-                    torch_profiler = torch.profiler.profile(
-                        activities=[
-                            torch.profiler.ProfilerActivity.CPU,
-                            torch.profiler.ProfilerActivity.CUDA,
-                        ],
-                        with_stack=True,
-                        record_shapes=args.profile_record_shapes,
-                    )
-                    torch_profiler.start()
-                if global_step == args.profile_start_step + args.profile_num_steps + 1:
-                    output_path = os.path.join(
-                        args.output_dir,
-                        f"profile_rank{torch.distributed.get_rank()}_{time.time()}.trace.json.gz",
-                    )
-                    print(f"End profile {output_path=}")
-                    torch_profiler.stop()
-                    torch_profiler.export_chrome_trace(output_path)
+        profiler.start()
+        for batch_idx, data in enumerate(islice(progress_bar, steps_to_skip, None), start=steps_to_skip):
+            steps_to_skip = 0 # reset for next epoch
+            global_step += 1
 
             # ================================================
             # 7.1 Training Step
             # ================================================
-            plosses, acces = run_forward(
-                args, eagle3_model, data, target_model, is_online
-            )
-            run_backward_and_update(args, plosses, optimizer, global_step)
+
+            if global_step % args.draft_accumulation_steps != 0:
+                context = eagle3_model.no_sync()
+            else:
+                context = nullcontext()
+
+            with context:
+                with record_function("forward"):
+                    plosses, acces = run_forward(
+                        args, eagle3_model, data, target_model, is_online
+                    )
+                log_memory(f"Step {global_step}: After forward")
+
+                with record_function("backward"):
+                    run_backward(args, plosses)
+                log_memory(f"Step {global_step}: After backward")
+
+
+            with record_function("optimizer"):
+                if global_step % args.draft_accumulation_steps == 0:
+                    optimizer.step()
+            log_memory(f"Step {global_step}: After optimizer step")
+
+            profiler.step()
 
             # log training metrics
             if global_step % (args.log_interval * args.draft_accumulation_steps) == 0:
+                acces_for_log = [acces[i].detach() for i in range(len(acces))]
+                plosses_for_log = [plosses[i].detach() for i in range(len(plosses))]
                 record_metrcs(
                     args,
-                    acces,
-                    plosses,
+                    acces_for_log,
+                    plosses_for_log,
                     global_step // args.draft_accumulation_steps,
                     tracker,
                     optimizer,
                     mode="train",
                 )
 
-            if dist.get_rank() == 0:
-                time_per_step = time.time() - last_time
-                last_time = time.time()
-                avg_loss = sum(pl for pl in plosses) / len(plosses)
-                avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{avg_loss:.2f}",
-                        "acc": f"{avg_acc:.2f}",
-                        "time": f"{time_per_step:.2f}s",
-                    }
-                )
+                if dist.get_rank() == 0:
+                    time_per_step = time.time() - last_time
+                    last_time = time.time()
+                    avg_loss = sum(pl for pl in plosses_for_log) / len(plosses_for_log)
+                    avg_acc = sum(acces_for_log) / len(acces_for_log)
+                    progress_bar.set_postfix(
+                        {
+                            "loss": f"{avg_loss:.2f}",
+                            "acc": f"{avg_acc:.2f}",
+                            "time": f"{time_per_step:.2f}s",
+                        }
+                    )
 
             # ================================================
             # 7.2 Evaluation Step
             # ================================================
             if (
                 args.eval_data_path is not None
-                and global_step % args.eval_interval == 0
+                and global_step % (args.eval_interval * args.draft_accumulation_steps) == 0
             ):
                 # Run evaluation
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
 
-                for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}"):
+                for data in tqdm(eval_dataloader, desc=f"Evaluating Epoch {epoch}", smoothing=0.01):
                     with torch.no_grad():
                         plosses, acces = run_forward(
                             args, eagle3_model, data, target_model, is_online
@@ -931,32 +1083,38 @@ def main():
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
+                last_eval_acc = torch.stack(eval_acces).mean().item()
+
                 record_metrcs(
                     args,
                     eval_acces,
                     eval_plosses,
-                    global_step,
+                    global_step // args.draft_accumulation_steps,
                     tracker,
                     mode="eval",
                 )
             # ================================================
             # 7.3 Save Checkpoints
             # ================================================
-            if global_step % args.save_interval == 0:
+            if global_step % (args.save_interval * args.draft_accumulation_steps) == 0:
                 # Save the model
-                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+                save_checkpoints(args, epoch, global_step, eagle3_model, optimizer, last_eval_acc)
 
-            if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            if args.max_num_steps is not None and global_step >= args.max_num_steps * args.draft_accumulation_steps:
                 break
 
-        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+        if args.max_num_steps is not None and global_step >= args.max_num_steps * args.draft_accumulation_steps:
             break
+    
+    profiler.export_chrome_trace(f"./profile_out/{dist.get_rank()}_{time.time()}.json")
+    profiler.stop()
+
     # Save final checkpoint if training ended without saving
-    if global_step % args.save_interval != 0:
+    if global_step % (args.save_interval * args.draft_accumulation_steps) != 0:
         print_on_rank0(
             f"Training completed at step {global_step}, saving final checkpoint..."
         )
-        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer, last_eval_acc)
 
     # Close the tracker
     tracker.close()
